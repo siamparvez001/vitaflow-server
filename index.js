@@ -9,18 +9,6 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-
-const requiredEnvVars = ['MONGO_DB_URI'];
-// const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
-
-// if (missingEnvVars.length > 0) {
-//     console.error(
-//         ` Missing required environment variable(s): ${missingEnvVars.join(', ')}`
-//     );
-//     console.error('   .env ফাইল আছে কিনা এবং সঠিক directory থেকে server চালু করছো কিনা চেক করো।');
-//     process.exit(1);
-// }
-
 const uri = process.env.MONGO_DB_URI;
 
 const client = new MongoClient(uri, {
@@ -290,7 +278,7 @@ async function run() {
 
 run();
 
-// ==================== GRACEFUL SHUTDOWN ====================
+
 process.on('SIGINT', async () => {
     console.log('\n Shutting down server...');
     await client.close();
