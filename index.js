@@ -1,19 +1,20 @@
 const express = require('express');
-const cors = require('cors')
+const cors = require('cors');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+require('dotenv').config();
+
 const app = express();
 const port = 5000;
-require('dotenv').config();
+
 app.use(cors());
 app.use(express.json());
 
-const { MongoClient, ServerApiVersion } = require('mongodb');
 app.get('/', (req, res) => {
     res.send('Hello World!');
 });
 
 const uri = process.env.MONGO_DB_URI;
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
     serverApi: {
         version: ServerApiVersion.v1,
@@ -24,60 +25,141 @@ const client = new MongoClient(uri, {
 
 async function run() {
     try {
-        // Connect the client to the server	(optional starting in v4.7)
         await client.connect();
 
-        const database = client.db("vitaflow")
-        const bloodCollection = database.collection("create-donation-request")
-         const usersCollection = database.collection("user");
-        const sessionCollection = database.collection("session")
+        const database = client.db("vitaflow");
+        const bloodCollection = database.collection("create-donation-request");
+        const usersCollection = database.collection("user");
+        const sessionCollection = database.collection("session");
 
+        // ==================== DONATION REQUEST ENDPOINTS ====================
+
+        // ১. সব ডোনেশন রিকোয়েস্ট (ফিল্টার সহ)
         app.get('/api/create-donation-request', async (req, res) => {
-            const query = {}
-            if (req.query.userId) {
-                query.userId = req.query.userId
-            }
-            if (req.query.status) {
-                query.status = req.query.status
-            }
-            const cursor = bloodCollection.find(query)
-            const result = await cursor.toArray();
-            res.send(result);
-        })
-
-
-        app.post('/api/create-donation-request', async (req, res) => {
             try {
-                const blood = req.body;
-
-                console.log("Received:", blood);
-
-                const result = await bloodCollection.insertOne(blood);
-
-                res.status(201).json(result);
+                const query = {};
+                if (req.query.userId) {
+                    query.userId = req.query.userId;
+                }
+                if (req.query.status) {
+                    query.status = req.query.status;
+                }
+                const result = await bloodCollection.find(query).toArray();
+                res.json(result);
             } catch (error) {
-                console.error("Route Error:", error);
-
-                res.status(500).json({
-                    message: error.message,
-                });
+                console.error("Error:", error);
+                res.status(500).json({ message: error.message });
             }
         });
 
+        // ২. নতুন ডোনেশন রিকোয়েস্ট তৈরি করা (POST)
+        app.post('/api/create-donation-request', async (req, res) => {
+            try {
+                const blood = req.body;
+                console.log("Received:", blood);
 
-        // আপনার ব্যাকএন্ডে (Express.js) এই কোডটুকু যোগ করুন
+                const result = await bloodCollection.insertOne(blood);
+                res.status(201).json(result);
+            } catch (error) {
+                console.error("Route Error:", error);
+                res.status(500).json({ message: error.message });
+            }
+        });
 
-        // ১. লগইন থাকা সিঙ্গেল ইউজারের প্রোফাইল ডাটা ডাটাবেজ থেকে খোঁজা
+        // ৩. আমার ডোনেশন রিকোয়েস্ট (email দিয়ে)
+        app.get('/api/my-donation-requests', async (req, res) => {
+            try {
+                const email = req.query.email;
+
+                if (!email) {
+                    return res.status(400).json({ message: "Email is required" });
+                }
+
+                // ইউজার খুঁজো email দিয়ে
+                const user = await usersCollection.findOne({ email: email });
+
+                if (!user) {
+                    return res.status(404).json({ message: "User not found" });
+                }
+
+                // সেই ইউজারের donation requests খুঁজো
+                const donations = await bloodCollection.find({
+                    userId: user._id.toString()
+                }).toArray();
+
+                res.json(donations);
+            } catch (error) {
+                console.error("Error fetching donations:", error);
+                res.status(500).json({ message: error.message });
+            }
+        });
+
+        // ==================== USER MANAGEMENT ENDPOINTS ====================
+
+        // ৪. সব ইউজার লিস্ট (All Users Page এর জন্য)
+        app.get('/api/all-users', async (req, res) => {
+            try {
+                const users = await usersCollection.find({}).toArray();
+                res.json(users);
+            } catch (error) {
+                console.error("Error fetching users:", error);
+                res.status(500).json({ message: error.message });
+            }
+        });
+
+        // ৫. ইউজার স্ট্যাটাস আপডেট (Block/Unblock)
+        app.patch('/api/all-users/status/:userId', async (req, res) => {
+            try {
+                const userId = req.params.userId;
+                const { status } = req.body;
+
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(userId) },
+                    { $set: { status: status } }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ message: "User not found" });
+                }
+
+                res.json({ success: true, message: "Status updated successfully" });
+            } catch (error) {
+                console.error("Error:", error);
+                res.status(500).json({ message: error.message });
+            }
+        });
+
+        // ৬. ইউজার রোল আপডেট (Admin/Volunteer)
+        app.patch('/api/all-users/role/:userId', async (req, res) => {
+            try {
+                const userId = req.params.userId;
+                const { role } = req.body;
+
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(userId) },
+                    { $set: { role: role } }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ message: "User not found" });
+                }
+
+                res.json({ success: true, message: "Role updated successfully" });
+            } catch (error) {
+                console.error("Error:", error);
+                res.status(500).json({ message: error.message });
+            }
+        });
+
+        // ==================== PROFILE ENDPOINTS ====================
+
+        // ৭. প্রোফাইল ডাটা ফেচ করা (email দিয়ে)
         app.get('/api/profile', async (req, res) => {
             try {
                 const email = req.query.email;
                 if (!email) {
                     return res.status(400).json({ message: "Email is required" });
                 }
-
-                // আপনার বেটার-অথ বা ইউজার কালেকশন থেকে ইমেইল অনুযায়ী ইউজার খোঁজা
-                // (যদি কালেকশনের নাম 'user' এর বদলে অন্য কিছু হয়, তবে সেটা দিবেন, যেমন 'users')
-                const usersCollection = database.collection("user");
 
                 const user = await usersCollection.findOne({ email: email });
 
@@ -92,34 +174,46 @@ async function run() {
             }
         });
 
-        // ২. প্রোফাইল আপডেট বা সেভ করার রাউট (PUT Request)
+        // ৮. প্রোফাইল আপডেট করা (PUT)
         app.put('/api/profile', async (req, res) => {
             try {
-                const body = req.body;
-                // এখানে আপনার ডাটাবেজের ইউজার আপডেট করার লজিক হবে
-                // যেমন: const result = await usersCollection.updateOne({ email: ... }, { $set: ... })
+                const { email, name, image, data } = req.body;
+
+                if (!email) {
+                    return res.status(400).json({ message: "Email is required" });
+                }
+
+                const result = await usersCollection.updateOne(
+                    { email: email },
+                    {
+                        $set: {
+                            name: name,
+                            image: image,
+                            data: data
+                        }
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ message: "User not found" });
+                }
 
                 res.json({ success: true, message: "Profile updated successfully" });
             } catch (error) {
+                console.error("Update Error:", error);
                 res.status(500).json({ message: error.message });
             }
         });
 
-        // আপনার এক্সপ্রেস (Express) ব্যাকএন্ডে এই কোডটি বসিয়ে দিন
-
+        // ৯. ইউজার প্রোফাইল সম্পূর্ণ আপডেট করা
         app.put('/api/user/profile', async (req, res) => {
             try {
                 const { name, image, data, email } = req.body;
 
-                // এখানে আপনার ফ্রন্টএন্ড ফর্ম থেকে পাঠানো ইউজারের ইমেইলটি লাগবে
-                // যদি ফ্রন্টএন্ড বডিতে ইমেইল না থাকে, তবে কোয়েরি প্যারামিটার বা সেশন থেকেও নিতে পারেন
                 if (!email) {
                     return res.status(400).json({ message: "User email is required to update profile" });
                 }
 
-                const usersCollection = database.collection("user");
-
-                // ডাটাবেজে ইমেইল অনুযায়ী ইউজারকে খুঁজে তার ফিল্ডগুলো আপডেট করা
                 const result = await usersCollection.updateOne(
                     { email: email },
                     {
@@ -149,22 +243,17 @@ async function run() {
             }
         });
 
-
-
-        // Send a ping to confirm a successful connection
+        // Database connection verify
         await client.db("admin").command({ ping: 1 });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
-    } catch (error) {
-        console.error("MongoDB Connection Error:", error);
-    }
+        console.log("✅ Successfully connected to MongoDB!");
 
+    } catch (error) {
+        console.error("❌ MongoDB Connection Error:", error);
+    }
 }
+
 run().catch(console.dir);
 
-
-
-
-
 app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`);
+    console.log(`🚀 Server listening on port ${port}`);
 });
