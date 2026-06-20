@@ -314,7 +314,7 @@ async function run() {
             })
         );
 
-        // ==================== USER MANAGEMENT (ADMIN ONLY) ====================
+        
 
         app.get(
             '/api/all-users',
@@ -617,7 +617,6 @@ async function run() {
         process.exit(1);
     }
 }
-
 run();
 
 process.on('SIGINT', async () => {
