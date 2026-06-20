@@ -9,6 +9,14 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+const requiredEnvVars = ['MONGO_DB_URI'];
+const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
+
+if (missingEnvVars.length > 0) {
+    console.error(` Missing required environment variable(s): ${missingEnvVars.join(', ')}`);
+    process.exit(1);
+}
+
 const uri = process.env.MONGO_DB_URI;
 
 const client = new MongoClient(uri, {
@@ -19,11 +27,9 @@ const client = new MongoClient(uri, {
     }
 });
 
-
 const asyncHandler = (fn) => (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
 };
-
 
 const toObjectId = (id) => {
     if (!ObjectId.isValid(id)) {
@@ -43,14 +49,10 @@ async function run() {
         const database = client.db('vitaflow');
         const bloodCollection = database.collection('create-donation-request');
         const usersCollection = database.collection('user');
-        const sessionCollection = database.collection('session');
 
-        
         app.get('/', (req, res) => {
             res.send('Hello World!');
         });
-
-        
 
         // ১. সব ডোনেশন রিকোয়েস্ট (ফিল্টার সহ)
         app.get(
@@ -69,10 +71,14 @@ async function run() {
         );
 
         // ২. নতুন ডোনেশন রিকোয়েস্ট তৈরি করা (POST)
+        // ✅ status পাঠানো না হলেও default "Pending" সেট হবে
         app.post(
             '/api/create-donation-request',
             asyncHandler(async (req, res) => {
-                const blood = req.body;
+                const blood = {
+                    ...req.body,
+                    status: req.body.status || 'Pending',
+                };
                 console.log('Received:', blood);
 
                 const result = await bloodCollection.insertOne(blood);
@@ -104,6 +110,53 @@ async function run() {
             })
         );
 
+        // ৩.৫ ✅ নতুন: Donate Now কনফার্ম করা (donor info সেভ + status আপডেট)
+        app.patch(
+            '/api/create-donation-request/donate/:id',
+            asyncHandler(async (req, res) => {
+                const requestId = toObjectId(req.params.id);
+                const { donorName, donorEmail } = req.body;
+
+                if (!donorName || !donorEmail) {
+                    return res
+                        .status(400)
+                        .json({ message: 'Donor name and email are required' });
+                }
+
+                // ইতিমধ্যে কেউ donate confirm করে ফেলেছে কিনা চেক করা
+                // (একই request এ দুইজন একসাথে donate চাপলে race condition এড়াতে)
+                const existing = await bloodCollection.findOne({ _id: requestId });
+
+                if (!existing) {
+                    return res.status(404).json({ message: 'Request not found' });
+                }
+
+                if (existing.status === 'In Progress') {
+                    return res
+                        .status(409)
+                        .json({ message: 'This request is already in progress' });
+                }
+
+                const result = await bloodCollection.updateOne(
+                    { _id: requestId },
+                    {
+                        $set: {
+                            status: 'In Progress',
+                            donorName,
+                            donorEmail,
+                            donatedAt: new Date(),
+                        },
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ message: 'Request not found' });
+                }
+
+                res.json({ success: true, message: 'Donation confirmed successfully' });
+            })
+        );
+
         // ==================== USER MANAGEMENT ENDPOINTS ====================
 
         // ৪. সব ইউজার লিস্ট (All Users Page এর জন্য)
@@ -112,6 +165,39 @@ async function run() {
             asyncHandler(async (req, res) => {
                 const users = await usersCollection.find({}).toArray();
                 res.json(users);
+            })
+        );
+
+        // ৪.৫ ✅ নতুন: Donor সার্চ (public Search page এর জন্য)
+        // blood group, district, upazila — যেগুলো পাঠানো হবে শুধু সেগুলো দিয়েই filter হবে
+        app.get(
+            '/api/search-donors',
+            asyncHandler(async (req, res) => {
+                const { bloodGroup, district, upazila } = req.query;
+
+                const query = {
+                    // blocked user দের donor list এ দেখানো হবে না
+                    status: { $ne: 'Blocked' },
+                };
+
+                if (bloodGroup) query['data.bloodGroup'] = bloodGroup;
+                if (district) query['data.district'] = district;
+                if (upazila) query['data.upazila'] = upazila;
+
+                const donors = await usersCollection
+                    .find(query)
+                    .project({
+                        name: 1,
+                        email: 1,
+                        image: 1,
+                        role: 1,
+                        'data.bloodGroup': 1,
+                        'data.district': 1,
+                        'data.upazila': 1,
+                    })
+                    .toArray();
+
+                res.json(donors);
             })
         );
 
@@ -220,9 +306,7 @@ async function run() {
                 }
 
                 if (!data) {
-                    return res
-                        .status(400)
-                        .json({ message: 'Profile data is required' });
+                    return res.status(400).json({ message: 'Profile data is required' });
                 }
 
                 const result = await usersCollection.updateOne(
@@ -252,35 +336,31 @@ async function run() {
         );
 
         // ==================== 404 HANDLER ====================
-        // কোনো route match না করলে clear 404 message দেবে, "Cannot GET ..." এর বদলে।
         app.use((req, res) => {
             res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
         });
 
         // ==================== GLOBAL ERROR HANDLER ====================
-        // asyncHandler থেকে আসা সব error এখানে এসে catch হবে।
         app.use((err, req, res, next) => {
-            console.error(' Server Error:', err);
+            console.error('Server Error:', err);
             res.status(err.statusCode || 500).json({
                 message: err.message || 'Internal Server Error',
             });
         });
 
-        // ✅ MongoDB connect সফল হওয়ার পরেই server চালু হবে
         app.listen(port, () => {
-            console.log(` Server listening on port ${port}`);
+            console.log(`Server listening on port ${port}`);
         });
     } catch (error) {
-        console.error(' MongoDB Connection Error:', error);
-        process.exit(1); // silent fail না করে স্পষ্টভাবে বন্ধ হবে
+        console.error('MongoDB Connection Error:', error);
+        process.exit(1);
     }
 }
 
 run();
 
-
 process.on('SIGINT', async () => {
-    console.log('\n Shutting down server...');
+    console.log('\nShutting down server...');
     await client.close();
     process.exit(0);
 });
