@@ -45,6 +45,11 @@ const toObjectId = (id) => {
     return new ObjectId(id);
 };
 
+// ✅ Regex special characters escape করার জন্য
+const escapeRegex = (str) => {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
 async function run() {
     try {
         await client.connect();
@@ -56,28 +61,34 @@ async function run() {
         const usersCollection = database.collection('user');
 
         // ==================== TRUST MIDDLEWARE ====================
-        // এই Express server শুধুই আমাদের Next.js server থেকে call accept করে
-        // (browser কখনো সরাসরি hit করে না - আমরা confirm করেছি)।
-        // x-internal-secret header verify করে নিশ্চিত হই call টা trusted সোর্স থেকে এসেছে।
         const verifyInternalRequest = (req, res, next) => {
             const secret = req.headers['x-internal-secret'];
-
             if (!secret || secret !== process.env.INTERNAL_API_SECRET) {
                 return res.status(401).json({ message: 'Unauthorized: invalid internal request' });
             }
             next();
         };
 
-        // x-user-email / x-user-role header থেকে logged-in user এর তথ্য বের করে req.authUser এ বসায়।
-        // Next.js নিজে Better Auth session থেকে এই হেডার দুটো বসায়, তাই এগুলো trusted।
-        const attachUser = (req, res, next) => {
+        // ✅ userId resolve করে req.authUser এ বসাবো
+        const attachUser = asyncHandler(async (req, res, next) => {
             const email = req.headers['x-user-email'] || null;
             const role = req.headers['x-user-role'] || null;
-            req.authUser = email ? { email, role } : null;
-            next();
-        };
 
-        // লগইন করা থাকতেই হবে (email/role header আসতেই হবে), নাহলে 401
+            if (!email) {
+                req.authUser = null;
+                return next();
+            }
+
+            const dbUser = await usersCollection.findOne({ email });
+            req.authUser = {
+                email,
+                role,
+                userId: dbUser?._id?.toString() || null,
+                status: dbUser?.status || 'Active',
+            };
+            next();
+        });
+
         const requireAuthUser = (req, res, next) => {
             if (!req.authUser) {
                 return res.status(401).json({ message: 'Unauthorized: login required' });
@@ -92,7 +103,6 @@ async function run() {
             next();
         };
 
-        // সব রুটে প্রথমে এই দুটো বসিয়ে দিচ্ছি
         app.use(verifyInternalRequest);
         app.use(attachUser);
 
@@ -102,8 +112,7 @@ async function run() {
 
         // ==================== DONATION REQUEST ENDPOINTS ====================
 
-        // পাবলিক হোমপেজ/donation-list পেজের জন্য - শুধু Pending request, login লাগে না
-        // (কিন্তু internal secret তো লাগবেই যেহেতু এটা শুধু Next.js থেকেই hit হয়)
+        // পাবলিক - শুধু Pending request, login লাগে না
         app.get(
             '/api/public-donation-requests',
             asyncHandler(async (req, res) => {
@@ -112,7 +121,7 @@ async function run() {
             })
         );
 
-        // সব ডোনেশন রিকোয়েস্ট (ফিল্টার সহ) - শুধু Admin/Volunteer
+        // সব ডোনেশন রিকোয়েস্ট (ফিল্টার সহ) - Admin/Volunteer
         app.get(
             '/api/create-donation-request',
             requireAuthUser,
@@ -127,7 +136,7 @@ async function run() {
             })
         );
 
-        // নির্দিষ্ট একটা request details - লগইন থাকলেই হবে (Donate Now পেজের জন্য)
+        // একটা request এর details - লগইন থাকলেই হবে
         app.get(
             '/api/create-donation-request/:id',
             requireAuthUser,
@@ -142,22 +151,21 @@ async function run() {
             })
         );
 
-        // নতুন রিকোয়েস্ট তৈরি - শুধু Donor, এবং active status থাকতে হবে
+        // নতুন রিকোয়েস্ট তৈরি - শুধু Donor
         app.post(
             '/api/create-donation-request',
             requireAuthUser,
             requireRoleHeader('Donor', 'Admin', 'Volunteer'),
             asyncHandler(async (req, res) => {
-                const requester = await usersCollection.findOne({ email: req.authUser.email });
-
-                if (requester?.status === 'Blocked') {
+                if (req.authUser.status === 'Blocked') {
                     return res.status(403).json({ message: 'Blocked users cannot create donation requests' });
                 }
 
                 const blood = {
                     ...req.body,
+                    userId: req.authUser.userId,
                     requesterEmail: req.authUser.email,
-                    status: req.body.status || 'Pending',
+                    status: 'Pending',
                 };
 
                 const result = await bloodCollection.insertOne(blood);
@@ -165,25 +173,14 @@ async function run() {
             })
         );
 
-        // নিজের রিকোয়েস্ট লিস্ট - শুধু Donor, শুধু নিজের ডাটা
+        // নিজের রিকোয়েস্ট লিস্ট - userId দিয়ে, শুধু Donor
         app.get(
             '/api/my-donation-requests',
             requireAuthUser,
             requireRoleHeader('Donor'),
             asyncHandler(async (req, res) => {
-                const email = req.query.email;
-
-                if (!email || email !== req.authUser.email) {
-                    return res.status(403).json({ message: 'Forbidden access' });
-                }
-
-                const user = await usersCollection.findOne({ email });
-                if (!user) {
-                    return res.status(404).json({ message: 'User not found' });
-                }
-
                 const donations = await bloodCollection
-                    .find({ userId: user._id.toString() })
+                    .find({ userId: req.authUser.userId })
                     .toArray();
 
                 res.json(donations);
@@ -202,7 +199,7 @@ async function run() {
                     return res.status(404).json({ message: 'Request not found' });
                 }
 
-                const isOwner = existing.requesterEmail === req.authUser.email;
+                const isOwner = existing.userId === req.authUser.userId;
                 const isStaff = ['Admin', 'Volunteer'].includes(req.authUser.role);
 
                 if (!isOwner && !isStaff) {
@@ -218,7 +215,7 @@ async function run() {
             })
         );
 
-        // স্ট্যাটাস আপডেট (inprogress -> done/canceled) - owner Donor, অথবা Volunteer (volunteer শুধু status আপডেট করতে পারবে requirement অনুযায়ী)
+        // স্ট্যাটাস আপডেট - owner (Donor), Admin, অথবা Volunteer
         app.patch(
             '/api/create-donation-request/status/:id',
             requireAuthUser,
@@ -236,7 +233,7 @@ async function run() {
                     return res.status(404).json({ message: 'Request not found' });
                 }
 
-                const isOwner = existing.requesterEmail === req.authUser.email;
+                const isOwner = existing.userId === req.authUser.userId;
                 const isAdmin = req.authUser.role === 'Admin';
                 const isVolunteer = req.authUser.role === 'Volunteer';
 
@@ -265,7 +262,7 @@ async function run() {
                     return res.status(404).json({ message: 'Request not found' });
                 }
 
-                const isOwner = existing.requesterEmail === req.authUser.email;
+                const isOwner = existing.userId === req.authUser.userId;
                 const isAdmin = req.authUser.role === 'Admin';
 
                 if (!isOwner && !isAdmin) {
@@ -305,6 +302,7 @@ async function run() {
                             status: 'In Progress',
                             donorName,
                             donorEmail,
+                            donorUserId: req.authUser.userId,
                             donatedAt: new Date(),
                         },
                     }
@@ -314,7 +312,7 @@ async function run() {
             })
         );
 
-        
+        // ==================== USER MANAGEMENT (ADMIN ONLY) ====================
 
         app.get(
             '/api/all-users',
@@ -328,29 +326,30 @@ async function run() {
             })
         );
 
-        // ✅ Donor সার্চ - পাবলিক পেজের জন্য, login লাগে না (FIXED with case-insensitive search)
+        // ✅ Donor সার্চ - FIXED with escapeRegex
         app.get(
             '/api/search-donors',
             asyncHandler(async (req, res) => {
                 const { bloodGroup, district, upazila } = req.query;
 
-                console.log("🔍 [Search Donors] Received query params:", { bloodGroup, district, upazila });
+                console.log("🔍 [Search Donors] Received query:", { bloodGroup, district, upazila });
 
-                // ✅ Base query: শুধু Active users, Blocked নয়
                 const query = { status: { $ne: 'Blocked' } };
 
-                // ✅ Case-insensitive search with regex
                 if (bloodGroup) {
-                    query['data.bloodGroup'] = { $regex: bloodGroup, $options: 'i' };
-                    console.log("   ✓ Blood group filter applied");
+                    const escaped = escapeRegex(bloodGroup);
+                    query['data.bloodGroup'] = { $regex: escaped, $options: 'i' };
+                    console.log(`   ✓ Blood Group filter: ${escaped}`);
                 }
                 if (district) {
-                    query['data.district'] = { $regex: district, $options: 'i' };
-                    console.log("   ✓ District filter applied");
+                    const escaped = escapeRegex(district);
+                    query['data.district'] = { $regex: escaped, $options: 'i' };
+                    console.log(`   ✓ District filter: ${escaped}`);
                 }
                 if (upazila) {
-                    query['data.upazila'] = { $regex: upazila, $options: 'i' };
-                    console.log("   ✓ Upazila filter applied");
+                    const escaped = escapeRegex(upazila);
+                    query['data.upazila'] = { $regex: escaped, $options: 'i' };
+                    console.log(`   ✓ Upazila filter: ${escaped}`);
                 }
 
                 console.log("📊 [Search Donors] MongoDB query:", JSON.stringify(query, null, 2));
@@ -371,7 +370,7 @@ async function run() {
 
                 console.log(`✅ [Search Donors] Found ${donors.length} donor(s)`);
                 if (donors.length > 0) {
-                    console.log("   Sample donor:", JSON.stringify(donors[0], null, 2));
+                    console.log("Sample donor:", JSON.stringify(donors[0], null, 2));
                 }
 
                 res.json(donors);
@@ -527,8 +526,7 @@ async function run() {
         );
 
         // ==================== INTERNAL USER MANAGEMENT ROUTES ====================
-        // এই routes গুলো Next.js frontend থেকে call হয়
-        // তাই internal secret verify করা হয়েছে middleware এ
+        // Admin only - internal routes
 
         // ✅ Get all users (Admin only) - internal route
         app.get(
@@ -617,6 +615,7 @@ async function run() {
         process.exit(1);
     }
 }
+
 run();
 
 process.on('SIGINT', async () => {
