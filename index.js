@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const jwt = require('jsonwebtoken'); // ✅ NEW
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
 
@@ -14,7 +15,8 @@ app.use(
 );
 app.use(express.json());
 
-const requiredEnvVars = ['MONGO_DB_URI', 'INTERNAL_API_SECRET'];
+// ✅ JWT_SECRET যোগ করা হলো required env vars এ
+const requiredEnvVars = ['MONGO_DB_URI', 'INTERNAL_API_SECRET', 'JWT_SECRET'];
 const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
 
 if (missingEnvVars.length > 0) {
@@ -45,7 +47,13 @@ const toObjectId = (id) => {
     return new ObjectId(id);
 };
 
-// ✅ Regex special characters escape করার জন্য
+const getPagination = (req) => {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.max(parseInt(req.query.limit) || 5, 1);
+    const skip = (page - 1) * limit;
+    return { page, limit, skip };
+};
+
 const escapeRegex = (str) => {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
@@ -69,25 +77,31 @@ async function run() {
             next();
         };
 
-        // ✅ userId resolve করে req.authUser এ বসাবো
-        const attachUser = asyncHandler(async (req, res, next) => {
-            const email = req.headers['x-user-email'] || null;
-            const role = req.headers['x-user-role'] || null;
+        const verifyJWT = (req, res, next) => {
+            const authHeader = req.headers['authorization'];
 
-            if (!email) {
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
                 req.authUser = null;
                 return next();
             }
 
-            const dbUser = await usersCollection.findOne({ email });
-            req.authUser = {
-                email,
-                role,
-                userId: dbUser?._id?.toString() || null,
-                status: dbUser?.status || 'Active',
-            };
+            const token = authHeader.split(' ')[1];
+
+            try {
+                const decoded = jwt.verify(token, process.env.JWT_SECRET);
+                req.authUser = {
+                    email: decoded.email,
+                    role: decoded.role,
+                    userId: decoded.userId,
+                    status: decoded.status || 'Active',
+                };
+            } catch (err) {
+                console.error('❌ JWT verification failed:', err.message);
+                req.authUser = null;
+            }
+
             next();
-        });
+        };
 
         const requireAuthUser = (req, res, next) => {
             if (!req.authUser) {
@@ -104,7 +118,7 @@ async function run() {
         };
 
         app.use(verifyInternalRequest);
-        app.use(attachUser);
+        app.use(verifyJWT);
 
         app.get('/', (req, res) => {
             res.send('Hello World!');
@@ -112,7 +126,6 @@ async function run() {
 
         // ==================== DONATION REQUEST ENDPOINTS ====================
 
-        // পাবলিক - শুধু Pending request, login লাগে না
         app.get(
             '/api/public-donation-requests',
             asyncHandler(async (req, res) => {
@@ -121,22 +134,31 @@ async function run() {
             })
         );
 
-        // সব ডোনেশন রিকোয়েস্ট (ফিল্টার সহ) - Admin/Volunteer
         app.get(
             '/api/create-donation-request',
             requireAuthUser,
             requireRoleHeader('Admin', 'Volunteer'),
             asyncHandler(async (req, res) => {
+                const { page, limit, skip } = getPagination(req);
+
                 const query = {};
                 if (req.query.userId) query.userId = req.query.userId;
                 if (req.query.status) query.status = req.query.status;
 
-                const result = await bloodCollection.find(query).toArray();
-                res.json(result);
+                const [result, total] = await Promise.all([
+                    bloodCollection.find(query).skip(skip).limit(limit).toArray(),
+                    bloodCollection.countDocuments(query),
+                ]);
+
+                res.json({
+                    data: result,
+                    total,
+                    page,
+                    totalPages: Math.ceil(total / limit) || 1,
+                });
             })
         );
 
-        // একটা request এর details - লগইন থাকলেই হবে
         app.get(
             '/api/create-donation-request/:id',
             requireAuthUser,
@@ -151,7 +173,6 @@ async function run() {
             })
         );
 
-        // নতুন রিকোয়েস্ট তৈরি - শুধু Donor
         app.post(
             '/api/create-donation-request',
             requireAuthUser,
@@ -173,21 +194,32 @@ async function run() {
             })
         );
 
-        // নিজের রিকোয়েস্ট লিস্ট - userId দিয়ে, শুধু Donor
         app.get(
             '/api/my-donation-requests',
             requireAuthUser,
             requireRoleHeader('Donor'),
             asyncHandler(async (req, res) => {
-                const donations = await bloodCollection
-                    .find({ userId: req.authUser.userId })
-                    .toArray();
+                const { page, limit, skip } = getPagination(req);
+                const filter = { userId: req.authUser.userId };
 
-                res.json(donations);
+                if (req.query.status) {
+                    filter.status = req.query.status;
+                }
+
+                const [donations, total] = await Promise.all([
+                    bloodCollection.find(filter).skip(skip).limit(limit).toArray(),
+                    bloodCollection.countDocuments(filter),
+                ]);
+
+                res.json({
+                    data: donations,
+                    total,
+                    page,
+                    totalPages: Math.ceil(total / limit) || 1,
+                });
             })
         );
 
-        // রিকোয়েস্ট এডিট - owner (Donor) অথবা Admin/Volunteer
         app.patch(
             '/api/create-donation-request/:id',
             requireAuthUser,
@@ -200,9 +232,9 @@ async function run() {
                 }
 
                 const isOwner = existing.userId === req.authUser.userId;
-                const isStaff = ['Admin', 'Volunteer'].includes(req.authUser.role);
+                const isAdmin = req.authUser.role === 'Admin';
 
-                if (!isOwner && !isStaff) {
+                if (!isOwner && !isAdmin) {
                     return res.status(403).json({ message: 'Forbidden access' });
                 }
 
@@ -215,7 +247,6 @@ async function run() {
             })
         );
 
-        // স্ট্যাটাস আপডেট - owner (Donor), Admin, অথবা Volunteer
         app.patch(
             '/api/create-donation-request/status/:id',
             requireAuthUser,
@@ -250,7 +281,6 @@ async function run() {
             })
         );
 
-        // রিকোয়েস্ট ডিলিট - owner (Donor) অথবা Admin
         app.delete(
             '/api/create-donation-request/:id',
             requireAuthUser,
@@ -274,7 +304,6 @@ async function run() {
             })
         );
 
-        // Donate Now কনফার্ম - লগইন করা যেকোনো ইউজার
         app.patch(
             '/api/create-donation-request/donate/:id',
             requireAuthUser,
@@ -319,40 +348,36 @@ async function run() {
             requireAuthUser,
             requireRoleHeader('Admin'),
             asyncHandler(async (req, res) => {
+                const { page, limit, skip } = getPagination(req);
+
                 const filter = {};
-                if (req.query.status) filter.status = req.query.status;
-                const users = await usersCollection.find(filter).toArray();
-                res.json(users);
+                if (req.query.status) {
+                    filter.status = req.query.status;
+                }
+
+                const [users, total] = await Promise.all([
+                    usersCollection.find(filter).skip(skip).limit(limit).toArray(),
+                    usersCollection.countDocuments(filter),
+                ]);
+
+                res.json({
+                    data: users,
+                    total,
+                    page,
+                    totalPages: Math.ceil(total / limit) || 1,
+                });
             })
         );
 
-        // ✅ Donor সার্চ - FIXED with escapeRegex
         app.get(
             '/api/search-donors',
             asyncHandler(async (req, res) => {
                 const { bloodGroup, district, upazila } = req.query;
-
-                console.log("🔍 [Search Donors] Received query:", { bloodGroup, district, upazila });
-
                 const query = { status: { $ne: 'Blocked' } };
 
-                if (bloodGroup) {
-                    const escaped = escapeRegex(bloodGroup);
-                    query['data.bloodGroup'] = { $regex: escaped, $options: 'i' };
-                    console.log(`   ✓ Blood Group filter: ${escaped}`);
-                }
-                if (district) {
-                    const escaped = escapeRegex(district);
-                    query['data.district'] = { $regex: escaped, $options: 'i' };
-                    console.log(`   ✓ District filter: ${escaped}`);
-                }
-                if (upazila) {
-                    const escaped = escapeRegex(upazila);
-                    query['data.upazila'] = { $regex: escaped, $options: 'i' };
-                    console.log(`   ✓ Upazila filter: ${escaped}`);
-                }
-
-                console.log("📊 [Search Donors] MongoDB query:", JSON.stringify(query, null, 2));
+                if (bloodGroup) query['data.bloodGroup'] = { $regex: escapeRegex(bloodGroup), $options: 'i' };
+                if (district) query['data.district'] = { $regex: escapeRegex(district), $options: 'i' };
+                if (upazila) query['data.upazila'] = { $regex: escapeRegex(upazila), $options: 'i' };
 
                 const donors = await usersCollection
                     .find(query)
@@ -367,11 +392,6 @@ async function run() {
                         'data.upazila': 1,
                     })
                     .toArray();
-
-                console.log(`✅ [Search Donors] Found ${donors.length} donor(s)`);
-                if (donors.length > 0) {
-                    console.log("Sample donor:", JSON.stringify(donors[0], null, 2));
-                }
 
                 res.json(donors);
             })
@@ -389,10 +409,7 @@ async function run() {
                     return res.status(400).json({ message: 'Status is required' });
                 }
 
-                const result = await usersCollection.updateOne(
-                    { _id: userId },
-                    { $set: { status } }
-                );
+                const result = await usersCollection.updateOne({ _id: userId }, { $set: { status } });
 
                 if (result.matchedCount === 0) {
                     return res.status(404).json({ message: 'User not found' });
@@ -415,10 +432,7 @@ async function run() {
                     return res.status(400).json({ message: 'Valid role is required' });
                 }
 
-                const result = await usersCollection.updateOne(
-                    { _id: userId },
-                    { $set: { role } }
-                );
+                const result = await usersCollection.updateOne({ _id: userId }, { $set: { role } });
 
                 if (result.matchedCount === 0) {
                     return res.status(404).json({ message: 'User not found' });
@@ -459,10 +473,7 @@ async function run() {
                     return res.status(403).json({ message: 'Forbidden access' });
                 }
 
-                const result = await usersCollection.updateOne(
-                    { email },
-                    { $set: { name, image, data } }
-                );
+                const result = await usersCollection.updateOne({ email }, { $set: { name, image, data } });
 
                 if (result.matchedCount === 0) {
                     return res.status(404).json({ message: 'User not found' });
@@ -472,43 +483,82 @@ async function run() {
             })
         );
 
-        app.put(
-            '/api/user/profile',
+
+        // এই দুইটা route তোমার server.js এ replace করো
+
+        // ✅ GET /api/fundings — সবার জন্য (authentication ছাড়াই দেখা যাবে)
+        app.get(
+            '/api/fundings',
+            asyncHandler(async (req, res) => {
+                const fundingsCollection = database.collection('fundings');
+                const fundings = await fundingsCollection
+                    .find({})
+                    .sort({ createdAt: -1 })
+                    .toArray();
+                res.json(fundings);
+            })
+        );
+
+        // ✅ POST /api/fundings — শুধু logged-in user save করতে পারবে
+        app.post(
+            '/api/fundings',
             requireAuthUser,
             asyncHandler(async (req, res) => {
-                const { name, image, data, email } = req.body;
+                const { amount, donorName, transactionId } = req.body;
 
-                if (!email || email !== req.authUser.email) {
-                    return res.status(403).json({ message: 'Forbidden access' });
+                if (!amount || amount < 1) {
+                    return res.status(400).json({ message: 'Valid amount is required' });
                 }
 
-                if (!data) {
-                    return res.status(400).json({ message: 'Profile data is required' });
+                if (!transactionId) {
+                    return res.status(400).json({ message: 'Transaction ID is required' });
                 }
 
-                const result = await usersCollection.updateOne(
-                    { email },
-                    {
-                        $set: {
-                            name,
-                            image,
-                            data: {
-                                bloodGroup: data.bloodGroup,
-                                district: data.district,
-                                upazila: data.upazila,
-                                title: data.title,
-                                donorStatus: data.donorStatus,
-                                visibility: data.visibility,
-                            },
-                        },
-                    }
-                );
+                const fundingsCollection = database.collection('fundings');
 
-                if (result.matchedCount === 0) {
-                    return res.status(404).json({ message: 'User not found to update' });
+                const funding = {
+                    // ✅ client থেকে আসা donorName সেভ করো
+                    donorName: donorName?.trim() || req.authUser.email,
+                    amount: parseFloat(amount),
+                    transactionId,
+                    userEmail: req.authUser.email,  // reference রাখো
+                    createdAt: new Date(),
+                };
+
+                const result = await fundingsCollection.insertOne(funding);
+                res.status(201).json(result);
+            })
+        );
+
+        // ✅ POST /api/create-payment-intent — Stripe payment intent তৈরি করো
+        app.post(
+            '/api/create-payment-intent',
+            requireAuthUser,
+            asyncHandler(async (req, res) => {
+                const { amount } = req.body;
+
+                if (!amount || amount < 1) {
+                    return res.status(400).json({ message: 'Valid amount is required' });
                 }
 
-                res.json({ success: true, message: 'Profile updated successfully', result });
+                if (!process.env.STRIPE_SECRET_KEY) {
+                    return res.status(500).json({ message: 'Stripe secret key not configured' });
+                }
+
+                // ✅ Stripe instance একবার তৈরি করো
+                const Stripe = require('stripe');
+                const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+                const paymentIntent = await stripe.paymentIntents.create({
+                    amount: Math.round(parseFloat(amount) * 100), // cents এ convert
+                    currency: 'usd',
+                    metadata: {
+                        userId: req.authUser.userId || 'unknown',
+                        userEmail: req.authUser.email,
+                    },
+                });
+
+                res.json({ clientSecret: paymentIntent.client_secret });
             })
         );
 
@@ -525,81 +575,11 @@ async function run() {
             })
         );
 
-        // ==================== INTERNAL USER MANAGEMENT ROUTES ====================
-        // Admin only - internal routes
-
-        // ✅ Get all users (Admin only) - internal route
-        app.get(
-            '/api/internal/all-users',
-            requireAuthUser,
-            requireRoleHeader('Admin'),
-            asyncHandler(async (req, res) => {
-                const filter = {};
-                if (req.query.status) filter.status = req.query.status;
-                const users = await usersCollection.find(filter).toArray();
-                res.json(users);
-            })
-        );
-
-        // ✅ Update user status (Admin only) - internal route
-        app.patch(
-            '/api/internal/user-status/:userId',
-            requireAuthUser,
-            requireRoleHeader('Admin'),
-            asyncHandler(async (req, res) => {
-                const userId = toObjectId(req.params.userId);
-                const { status } = req.body;
-
-                if (!status) {
-                    return res.status(400).json({ message: 'Status is required' });
-                }
-
-                const result = await usersCollection.updateOne(
-                    { _id: userId },
-                    { $set: { status } }
-                );
-
-                if (result.matchedCount === 0) {
-                    return res.status(404).json({ message: 'User not found' });
-                }
-
-                res.json({ success: true, message: 'Status updated successfully' });
-            })
-        );
-
-        // ✅ Update user role (Admin only) - internal route
-        app.patch(
-            '/api/internal/user-role/:userId',
-            requireAuthUser,
-            requireRoleHeader('Admin'),
-            asyncHandler(async (req, res) => {
-                const userId = toObjectId(req.params.userId);
-                const { role } = req.body;
-
-                const validRoles = ['Donor', 'Volunteer', 'Admin'];
-                if (!role || !validRoles.includes(role)) {
-                    return res.status(400).json({ message: 'Valid role is required' });
-                }
-
-                const result = await usersCollection.updateOne(
-                    { _id: userId },
-                    { $set: { role } }
-                );
-
-                if (result.matchedCount === 0) {
-                    return res.status(404).json({ message: 'User not found' });
-                }
-
-                res.json({ success: true, message: 'Role updated successfully' });
-            })
-        );
-
-        // ==================== 404 HANDLER ====================
+        // ==================== 404 + ERROR HANDLER ====================
         app.use((req, res) => {
             res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
         });
 
-        // ==================== GLOBAL ERROR HANDLER ====================
         app.use((err, req, res, next) => {
             console.error('Server Error:', err);
             res.status(err.statusCode || 500).json({
