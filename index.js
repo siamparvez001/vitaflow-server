@@ -15,7 +15,7 @@ app.use(
 );
 app.use(express.json());
 
-// ✅ JWT_SECRET যোগ করা হলো required env vars এ
+//  JWT_SECRET যোগ করা হলো required env vars এ
 const requiredEnvVars = ['MONGO_DB_URI', 'INTERNAL_API_SECRET', 'JWT_SECRET'];
 const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
 
@@ -117,7 +117,7 @@ async function run() {
             next();
         };
 
-        app.use(verifyInternalRequest);
+        // app.use(verifyInternalRequest);
         app.use(verifyJWT);
 
         app.get('/', (req, res) => {
